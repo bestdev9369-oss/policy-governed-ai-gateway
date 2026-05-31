@@ -2,17 +2,18 @@ import type { PolicyRule } from '@pgag/shared';
 import type { EvaluationContext, EvaluationResult, PolicyStore } from './types.js';
 
 /**
- * PolicyEvaluator is the core decision engine.
+ * PolicyEvaluator — the core, stateless decision engine.
  *
  * Evaluation order:
- *   1. Sort active policies by priority (descending — higher priority wins).
- *   2. Walk each policy; check all conditions as gates.
- *      - If any condition fails, the policy is SKIPPED (not a match).
- *      - Track the rejection reason for use in the fail-closed response.
- *   3. First policy whose ALL conditions pass determines the outcome.
- *   4. If no policy matches, fail-closed: deny with the last rejection reason.
+ *   1. Load active policies for the tenant, sorted by priority descending.
+ *   2. For each policy, run all conditions as gates.
+ *      - A failed condition means this policy does NOT apply — skip it.
+ *      - Record the first rejection reason for diagnostic reporting.
+ *   3. First policy whose conditions ALL pass determines the outcome.
+ *   4. If no policy matches: fail-closed (deny), surfacing the highest-priority
+ *      rejection reason to help operators debug access configuration.
  *
- * Intentionally pure and side-effect-free — the caller owns persistence and telemetry.
+ * Intentionally pure and side-effect-free. The caller owns all I/O.
  */
 export class PolicyEvaluator {
   constructor(private readonly store: PolicyStore) {}
@@ -24,16 +25,19 @@ export class PolicyEvaluator {
       .filter((p) => p.enabled && p.toolName === ctx.toolName)
       .sort((a, b) => b.priority - a.priority);
 
-    // Track the most-recent condition-rejection reason so fail-closed denials
-    // carry a useful diagnostic message rather than a generic fallback.
-    let lastRejectionReason: string | null = null;
+    // Capture the FIRST rejection reason (from the highest-priority policy that
+    // almost-matched). This surfaces the most operationally relevant diagnostic
+    // rather than a low-priority policy's message.
+    let firstRejectionReason: string | null = null;
 
     for (const policy of active) {
       const rejection = this.checkConditions(policy, ctx);
 
       if (rejection !== null) {
-        // A condition failed — this policy does not apply. Record why.
-        lastRejectionReason = rejection;
+        // Condition gate failed — this policy does not apply.
+        if (firstRejectionReason === null) {
+          firstRejectionReason = rejection;
+        }
         continue;
       }
 
@@ -47,46 +51,54 @@ export class PolicyEvaluator {
       };
     }
 
-    // Fail-closed: no policy matched.
+    // Fail-closed: deny by default, with the best available diagnostic.
     return {
       decision: 'deny',
-      reason: lastRejectionReason ?? 'No matching policy found. Default action is deny (fail-closed).',
+      reason:
+        firstRejectionReason ??
+        'No matching policy found. Default action is deny (fail-closed).',
       evaluatedPolicies: active.length,
     };
   }
 
   /**
    * Check all conditions for a policy against the request context.
-   * Returns null if ALL conditions pass (policy can fire).
-   * Returns a non-null rejection reason string if any condition fails.
+   * Returns null if ALL conditions pass (policy is eligible to fire).
+   * Returns a rejection reason string if any condition fails.
    */
   private checkConditions(policy: PolicyRule, ctx: EvaluationContext): string | null {
     // Scope gate — agent must hold the required scope.
     if (policy.requiredScope) {
       if (!ctx.agentScopes.includes(policy.requiredScope)) {
-        return `Agent lacks required scope '${policy.requiredScope}' for tool '${ctx.toolName}'. Policy: ${policy.name}`;
+        return (
+          `Agent lacks required scope '${policy.requiredScope}' ` +
+          `for tool '${ctx.toolName}'. Policy: ${policy.name}`
+        );
       }
     }
 
-    // Agent allowlist gate — agent must be explicitly listed.
+    // Allowlist gate — if set, agent must be explicitly listed.
     if (policy.allowedAgentIds && policy.allowedAgentIds.length > 0) {
       if (!policy.allowedAgentIds.includes(ctx.agentId)) {
         return `Agent '${ctx.agentId}' is not in the allowlist for policy '${policy.name}'`;
       }
     }
 
-    // Agent blocklist gate — agent must NOT be listed.
+    // Blocklist gate — agent must NOT appear in this list.
     if (policy.blockedAgentIds && policy.blockedAgentIds.length > 0) {
       if (policy.blockedAgentIds.includes(ctx.agentId)) {
         return `Agent '${ctx.agentId}' is explicitly blocked by policy '${policy.name}'`;
       }
     }
 
-    // Amount threshold gate — toolArgs amount must be within the allowed maximum.
+    // Amount threshold gate — extract amount from well-known toolArg fields.
     if (policy.maxAmount !== undefined && policy.maxAmount !== null) {
       const amount = this.extractAmount(ctx.toolArgs);
       if (amount !== null && amount > policy.maxAmount) {
-        return `Amount ${amount} exceeds maximum allowed ${policy.maxAmount} for tool '${ctx.toolName}'. Policy: ${policy.name}`;
+        return (
+          `Amount ${amount} exceeds maximum ${policy.maxAmount} ` +
+          `for tool '${ctx.toolName}'. Policy: ${policy.name}`
+        );
       }
     }
 

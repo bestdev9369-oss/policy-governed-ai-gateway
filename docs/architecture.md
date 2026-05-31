@@ -1,137 +1,176 @@
 # Architecture
 
-## Overview
+## Why a separate gateway?
 
-Policy-Governed AI Gateway is a control-plane service that sits between autonomous agents and their tool execution environment. Every tool call passes through authentication, policy evaluation, optional human approval, and audit logging before being executed — or blocked.
+Agents should not self-govern. An agent that decides for itself whether it is allowed to call a tool is not a controlled system — it is a trusted process with no external check. The gateway enforces authorization externally, so the control surface is independent of the agent's code and can be updated without redeploying agents.
 
-## System Components
+This pattern mirrors how network infrastructure is designed: firewalls sit outside the application, not inside it.
+
+---
+
+## System overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Agent / Application                         │
-│              (any system calling tools via MCP or HTTP)             │
+│                         Agent / Application                          │
+│            (any system invoking tools: LLM agent, script, CI job)   │
 └──────────────────────────────┬──────────────────────────────────────┘
+                               │
                                │  POST /v1/gateway/invoke
-                               │  X-API-Key: {tenant-key}
+                               │  X-API-Key: {tenant-api-key}
+                               │  traceparent: 00-{traceId}-{spanId}-01
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          Gateway API (Fastify)                       │
+│                       Gateway API  (Fastify + TypeScript)            │
 │                                                                      │
-│  ┌─────────────┐  ┌──────────────────┐  ┌────────────────────────┐ │
-│  │  Auth Layer │  │  Rate Limiter    │  │  Request Validator     │ │
-│  │  (API Key / │  │  (Redis sliding  │  │  (Zod schema)          │ │
-│  │   JWT)      │  │   window)        │  │                        │ │
-│  └──────┬──────┘  └────────┬─────────┘  └──────────┬─────────────┘ │
-│         └──────────────────┴───────────────────────┘               │
-│                               │                                      │
-│                               ▼                                      │
+│  1. authenticate      Validate API key → attach tenant context       │
+│  2. rate-limit        Redis sliding-window; RFC 6585 headers on resp │
+│  3. validate          Zod schema + strip __proto__ / constructor     │
+│  4. resolve agent     Fetch agentId; enforce tenant isolation        │
+│  5. write pending     INSERT gateway_requests (status=pending)       │
+│                                                                      │
 │  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                    Policy Engine                               │  │
+│  │                      Policy Engine                             │  │
 │  │                                                               │  │
-│  │  1. Load tenant policies (priority-sorted)                    │  │
-│  │  2. Evaluate conditions:                                      │  │
-│  │     • required_scope     — agent has this scope?              │  │
-│  │     • allowed_agent_ids  — agent in allowlist?                │  │
-│  │     • blocked_agent_ids  — agent in blocklist?                │  │
-│  │     • max_amount         — toolArgs.amount ≤ threshold?       │  │
-│  │  3. Return first matching policy decision:                    │  │
-│  │     allow │ deny │ approval_required                          │  │
-│  │  4. Default: deny (fail-closed)                               │  │
-│  └─────────────────────────────┬─────────────────────────────────┘  │
-│                                │                                     │
-│            ┌───────────────────┼───────────────────┐                │
-│            │                   │                   │                │
-│            ▼                   ▼                   ▼                │
-│       ┌─────────┐       ┌────────────┐    ┌──────────────┐         │
-│       │  ALLOW  │       │   DENY     │    │  APPROVAL    │         │
-│       │         │       │            │    │  REQUIRED    │         │
-│       └────┬────┘       └─────┬──────┘    └──────┬───────┘         │
-│            │                  │                   │                 │
-│            ▼                  │                   ▼                 │
-│  ┌─────────────────┐          │          ┌─────────────────┐        │
-│  │  Tool Executor  │          │          │  Approval Queue  │        │
-│  │  (Mock / MCP)   │          │          │  (Postgres row)  │        │
-│  └────────┬────────┘          │          └────────┬────────┘        │
-│           │                   │                   │                 │
-│           └───────────────────┼───────────────────┘                │
-│                               │                                     │
-│                               ▼                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                   Audit + Observability                        │  │
-│  │                                                               │  │
-│  │  • audit_logs row  — immutable trail of every action          │  │
-│  │  • cost_events row — token count + USD estimate               │  │
-│  │  • structured JSON log — trace_id, latency_ms, decision       │  │
-│  │  • /metrics endpoint — Prometheus-compatible counters          │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
+│  │  • Load all enabled policies for tenant, sort by priority ↓  │  │
+│  │  • For each policy, gate on conditions:                       │  │
+│  │      requiredScope   agent.scopes must include it             │  │
+│  │      allowedAgentIds agent must be in list (if set)           │  │
+│  │      blockedAgentIds agent must NOT be in list (if set)       │  │
+│  │      maxAmount       toolArgs.amount must be ≤ threshold      │  │
+│  │  • First policy where ALL conditions pass → fires             │  │
+│  │  • No match → deny (fail-closed)                              │  │
+│  └────────────────────┬──────────────────────────────────────────┘  │
+│                       │                                              │
+│         ┌─────────────┼──────────────┐                               │
+│       allow         deny     approval_required                       │
+│         │             │              │                               │
+│   executeTool()    log & block   INSERT approvals                    │
+│   (try/catch)          │         return 202                          │
+│         │             │              │                               │
+│         └─────────────┴──────────────┘                               │
+│                       │                                              │
+│  6. write audit log   INSERT audit_logs (append-only)                │
+│  7. write cost event  INSERT cost_events (token count + USD)         │
+│  8. emit metrics      Prometheus counters + histograms               │
+│  9. propagate trace   trace_id in response + every log line          │
+└──────────────────────────────────────────────────────────────────────┘
                                │
-                               ▼
-              ┌────────────────────────────────┐
-              │   PostgreSQL (persistent store) │
-              │   Redis (rate limiting)         │
-              └────────────────────────────────┘
-                               │
-                               ▼
-              ┌────────────────────────────────┐
-              │   Dashboard (React / Vite)      │
-              │   • Request list + filters      │
-              │   • Decision badges             │
-              │   • Approval action buttons     │
-              │   • Audit log viewer            │
-              │   • Policy browser              │
-              └────────────────────────────────┘
+                    ┌──────────┴──────────┐
+               PostgreSQL             Redis
+              (all state)        (rate limiting)
+                    │
+                    ▼
+             React Dashboard
+             (reads via same API, same auth)
 ```
 
-## Request Lifecycle
+---
 
-1. **Receive** — Fastify accepts the `POST /v1/gateway/invoke` request.
-2. **Authenticate** — API key is validated against the `tenants` table. Tenant context is attached to the request.
-3. **Rate-limit** — A Redis sliding-window check prevents abuse per tenant per endpoint.
-4. **Validate** — Zod schema ensures required fields are present and well-formed.
-5. **Resolve agent** — Agent record is fetched; tenant isolation is enforced (agent must belong to the requesting tenant).
-6. **Write pending record** — `gateway_requests` row is written with `status=pending` so any crash leaves a trace.
-7. **Evaluate policy** — `PolicyEvaluator.evaluate()` walks the tenant's policy rules, sorted by priority.
-8. **Branch on decision**:
-   - `allow` → execute tool, write cost event, update status to `allowed`
-   - `deny` → skip execution, update status to `denied`, return 403
-   - `approval_required` → create `approvals` row, return 202, wait for human action
-9. **Audit log** — Every state transition writes an `audit_logs` row.
-10. **Metrics** — Counters and histograms updated for Prometheus scraping.
-11. **Respond** — Structured JSON response with decision, reason, trace_id, and cost estimate.
-
-## Data Model
+## Data model
 
 ```
-tenants ──< users
-        ──< agents ──< gateway_requests ──< policy_decisions
-                                        ──< approvals
-                                        ──< cost_events
-                                        ──< audit_logs
-        ──< policies
+tenants ─────┬──< users
+             ├──< agents ──────< gateway_requests ──< policy_decisions
+             │                                     ──< approvals
+             │                                     ──< cost_events
+             │                                     ──< audit_logs
+             └──< policies
 ```
 
-## Policy Evaluation Detail
+All tables are scoped by `tenant_id`. There is no query in the codebase that can return data across tenant boundaries.
 
-Policies are evaluated in descending priority order. The first policy whose conditions all pass determines the outcome. Conditions are ANDed (all must pass). If no policy matches, the gateway fails closed (`deny`).
+---
 
-### Condition evaluation order
+## Policy evaluation in detail
 
-1. `enabled` check (disabled policies are skipped entirely)
-2. `toolName` match
-3. `requiredScope` — agent's scopes array must include the required scope
-4. `allowedAgentIds` — if set, agent must be in the list
-5. `blockedAgentIds` — if set, agent must NOT be in the list
-6. `maxAmount` — extracts amount from `toolArgs.amount|value|transfer_amount|payment_amount`
+Policies are the core control surface. The evaluator (`packages/policy-engine`) is a pure function with no I/O — it takes a context and returns a decision. This makes it straightforward to test and easy to reason about.
 
-## Observability Integration
+```
+evaluate(context) → { decision, reason, matchedPolicyId }
 
-The gateway produces three observability artifacts on every request:
+context = {
+  tenantId    string
+  agentId     string
+  agentScopes string[]
+  toolName    string
+  toolArgs    Record<string, unknown>
+}
+```
 
-| Artifact | Format | Integration point |
+**Evaluation algorithm:**
+
+```
+1. Load policies WHERE tenant_id = ctx.tenantId AND tool_name = ctx.toolName
+2. Sort by priority DESC (higher number = evaluated first)
+3. For each policy:
+   a. If requiredScope set AND agent lacks it → skip (record reason)
+   b. If allowedAgentIds set AND agent not in list → skip
+   c. If blockedAgentIds set AND agent in list → skip
+   d. If maxAmount set AND toolArgs.amount > maxAmount → skip
+   e. All conditions passed → return policy.decision + policy.reason
+4. If no policy matched → return deny + first rejection reason from step 3
+```
+
+The "first rejection reason" at step 4 surfaces the highest-priority near-miss, giving operators the most useful diagnostic when debugging access configuration.
+
+**Why fail-closed?** The alternative — failing open when no policy exists — would silently grant access to any tool as soon as a tenant's policy configuration has a gap. Fail-closed means a misconfigured policy set shows up as unexpected denials (visible, correctable) rather than unexpected permissions (invisible until exploited).
+
+---
+
+## Approval flow
+
+```
+Agent             Gateway                   Operator
+  │                  │                          │
+  │──invoke()───────►│                          │
+  │                  │ eval → approval_required │
+  │◄──202 approvalId─│                          │
+  │                  │──notify(approvalId)──────►│  (via dashboard / webhook)
+  │                  │                          │
+  │                  │◄──POST /approve──────────│
+  │                  │                          │
+  │                  │ atomic UPDATE WHERE       │
+  │                  │   status='pending'        │  (prevents double-execution)
+  │                  │                          │
+  │                  │ executeTool()             │
+  │                  │ write cost_event          │
+  │                  │ write audit_log           │
+  │◄──result─────────│                          │
+```
+
+The approval status update uses `UPDATE WHERE status='pending'` as a compare-and-swap operation. If two operators approve simultaneously, only one write succeeds; the other receives a 409.
+
+---
+
+## Observability model
+
+The gateway produces three complementary signals on every request:
+
+| Signal | Format | Primary use |
 |---|---|---|
-| Structured log | JSON lines to stdout | Datadog, Grafana Loki, CloudWatch Logs |
-| Trace context | W3C traceparent header | Jaeger, Grafana Tempo, AWS X-Ray |
-| Metrics | Prometheus text format (`/metrics`) | Prometheus + Grafana, Datadog Agent |
+| Structured log line | JSON to stdout | Search, alerting, dashboards (Loki, Datadog, CloudWatch) |
+| Trace context | W3C `traceparent` header + `trace_id` in logs | Distributed tracing (Tempo, Jaeger, Datadog APM) |
+| Metrics | Prometheus text at `/metrics` | Time-series, SLO tracking (Prometheus + Grafana) |
 
-To connect to an OpenTelemetry collector, add `@opentelemetry/sdk-node` and configure the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. The `trace_id` field already follows the W3C 128-bit format and maps directly to OTLP trace IDs.
+The `trace_id` field is a 128-bit hex string that maps directly to W3C traceparent and OpenTelemetry trace IDs. Adding `@opentelemetry/sdk-node` with an OTLP exporter enables full distributed tracing without changing any application code.
+
+---
+
+## What a production MCP transport layer would look like
+
+The current `executeTool()` mock would be replaced by a real MCP client:
+
+```
+Gateway                    MCP Server (tool provider)
+  │                              │
+  │──spawn/connect()────────────►│  (stdio or SSE transport)
+  │                              │
+  │──tools/call {name, args}────►│
+  │                              │
+  │◄──result stream──────────────│
+  │                              │
+  │──close()────────────────────►│
+```
+
+The gateway would maintain a registry of tool servers (analogous to DNS for tools), resolve the correct server for each `toolName`, open an MCP session, proxy the call, and close the session. The policy evaluation and audit logging would remain unchanged — the transport is an implementation detail behind `executeTool()`.

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages
+        run: |
+          pnpm --filter @pgag/shared build
+          pnpm --filter @pgag/policy-engine build
+          pnpm --filter @pgag/api build
+          pnpm --filter @pgag/web build
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Check formatting
+        run: pnpm --filter @pgag/policy-engine exec tsc --noEmit

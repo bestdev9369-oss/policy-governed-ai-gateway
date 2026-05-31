@@ -7,11 +7,21 @@ import { getDb, schema } from '../db/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { executeTool } from '../services/tool-executor.js';
 import { estimateCost } from '../services/cost-estimator.js';
-import { checkRateLimit } from '../services/rate-limiter.js';
+import { checkRateLimit, applyRateLimitHeaders } from '../services/rate-limiter.js';
 import { logger } from '../logger.js';
 import { metrics, METRIC } from '../metrics.js';
 import { newTraceContext, parseTraceParent, gatewayEvent } from '../services/telemetry.js';
 import type { PolicyRule } from '@pgag/shared';
+
+// Strip prototype-polluting keys from toolArgs before persisting or executing.
+function sanitizeArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const safe: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    safe[k] = v;
+  }
+  return safe;
+}
 
 const InvokeSchema = z.object({
   agentId: z.string().min(1),
@@ -28,8 +38,8 @@ export async function gatewayRoutes(app: FastifyInstance) {
   /**
    * POST /v1/gateway/invoke
    *
-   * The primary endpoint. Accepts a tool invocation request, evaluates
-   * policies, executes (or blocks) the tool, and writes the full audit trail.
+   * Primary endpoint. Authenticates, rate-limits, evaluates policy, and either
+   * executes the tool, blocks it, or queues it for human approval.
    */
   app.post(
     '/v1/gateway/invoke',
@@ -37,7 +47,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const start = Date.now();
 
-      // ── Parse and validate input ─────────────────────────────────────────
+      // ── Parse and validate ────────────────────────────────────────────────
       const parsed = InvokeSchema.safeParse(request.body);
       if (!parsed.success) {
         return reply.status(400).send({
@@ -47,28 +57,36 @@ export async function gatewayRoutes(app: FastifyInstance) {
         });
       }
 
-      const { agentId, toolName, toolArgs } = parsed.data;
+      const { agentId, toolName } = parsed.data;
+      const toolArgs = sanitizeArgs(parsed.data.toolArgs);
       const db = getDb();
 
-      // ── Establish trace context ──────────────────────────────────────────
-      const parentTraceId = parseTraceParent(request.headers['traceparent'] as string | undefined);
+      // ── Trace context ─────────────────────────────────────────────────────
+      const parentTraceId = parseTraceParent(
+        request.headers['traceparent'] as string | undefined,
+      );
       const traceCtx = newTraceContext(parsed.data.traceId ?? parentTraceId);
       const { traceId } = traceCtx;
       const requestId = uuidv4();
 
-      // ── Rate limiting ───────────────────────────────────────────────────
+      // ── Rate limiting ─────────────────────────────────────────────────────
       const redis = (app as any).redis ?? null;
-      const rateCheck = await checkRateLimit(redis, request.tenantId, 'invoke');
-      if (!rateCheck.allowed) {
-        metrics.incCounter(METRIC.REQUEST_TOTAL, { tenant: request.tenantId, status: 'rate_limited' });
+      const rateResult = await checkRateLimit(redis, request.tenantId, 'invoke');
+      applyRateLimitHeaders(reply, rateResult, parseInt(process.env['RATE_LIMIT_MAX'] ?? '100', 10));
+
+      if (!rateResult.allowed) {
+        metrics.incCounter(METRIC.REQUEST_TOTAL, {
+          tenant: request.tenantId,
+          status: 'rate_limited',
+        });
         return reply.status(429).send({
           code: 'RATE_LIMIT_EXCEEDED',
           message: 'Rate limit exceeded for this tenant',
-          resetAt: new Date(rateCheck.resetAt).toISOString(),
+          resetAt: new Date(rateResult.resetAt).toISOString(),
         });
       }
 
-      // ── Resolve agent ────────────────────────────────────────────────────
+      // ── Resolve agent ─────────────────────────────────────────────────────
       const [agent] = await db
         .select()
         .from(schema.agents)
@@ -84,7 +102,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
         });
       }
 
-      // ── Write initial request record ─────────────────────────────────────
+      // ── Write initial pending record ──────────────────────────────────────
       await db.insert(schema.gatewayRequests).values({
         id: requestId,
         tenantId: request.tenantId,
@@ -96,7 +114,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
         status: 'pending',
       });
 
-      // ── Policy evaluation ────────────────────────────────────────────────
+      // ── Policy evaluation ─────────────────────────────────────────────────
       const policyStore: DbPolicyStore = {
         async getPoliciesForTenant(tenantId: string): Promise<PolicyRule[]> {
           const rows = await db
@@ -138,7 +156,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
         tool: toolName,
       });
 
-      // ── Write policy decision record ─────────────────────────────────────
+      // ── Write policy decision record ──────────────────────────────────────
       await db.insert(schema.policyDecisions).values({
         id: uuidv4(),
         requestId,
@@ -148,14 +166,11 @@ export async function gatewayRoutes(app: FastifyInstance) {
         reason: evalResult.reason,
       });
 
-      // ── Branch on decision ───────────────────────────────────────────────
-      let toolResult: Record<string, unknown> | undefined;
-      let finalStatus: string;
-      let latencyMs: number;
-      let costEstimate: number | undefined;
+      const latencyMs = () => Date.now() - start;
 
+      // ── DENY ──────────────────────────────────────────────────────────────
       if (evalResult.decision === 'deny') {
-        finalStatus = 'denied';
+        const ms = latencyMs();
 
         await db
           .update(schema.gatewayRequests)
@@ -164,7 +179,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
             decision: 'deny',
             decisionReason: evalResult.reason,
             matchedPolicyId: evalResult.matchedPolicyId,
-            latencyMs: Date.now() - start,
+            latencyMs: ms,
             resolvedAt: new Date(),
           })
           .where(eq(schema.gatewayRequests.id, requestId));
@@ -179,9 +194,8 @@ export async function gatewayRoutes(app: FastifyInstance) {
           detail: { decision: 'deny', reason: evalResult.reason, tool: toolName },
         });
 
-        latencyMs = Date.now() - start;
         metrics.incCounter(METRIC.REQUEST_TOTAL, { tenant: request.tenantId, status: 'denied' });
-        metrics.observeHistogram(METRIC.REQUEST_LATENCY_MS, latencyMs, { tenant: request.tenantId });
+        metrics.observeHistogram(METRIC.REQUEST_LATENCY_MS, ms, { tenant: request.tenantId });
 
         logger.info(
           'Gateway request denied',
@@ -194,7 +208,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
             toolName,
             decision: 'deny',
             reason: evalResult.reason,
-            latencyMs,
+            latencyMs: ms,
           }),
         );
 
@@ -204,15 +218,15 @@ export async function gatewayRoutes(app: FastifyInstance) {
           decision: 'deny',
           status: 'denied',
           reason: evalResult.reason,
-          costEstimate: 0,
-          latencyMs,
+          latencyMs: ms,
         });
       }
 
+      // ── APPROVAL REQUIRED ─────────────────────────────────────────────────
       if (evalResult.decision === 'approval_required') {
-        finalStatus = 'approval_required';
-
         const approvalId = uuidv4();
+        const ms = latencyMs();
+
         await db.insert(schema.approvals).values({
           id: approvalId,
           requestId,
@@ -227,7 +241,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
             decision: 'approval_required',
             decisionReason: evalResult.reason,
             matchedPolicyId: evalResult.matchedPolicyId,
-            latencyMs: Date.now() - start,
+            latencyMs: ms,
           })
           .where(eq(schema.gatewayRequests.id, requestId));
 
@@ -241,10 +255,12 @@ export async function gatewayRoutes(app: FastifyInstance) {
           detail: { approvalId, reason: evalResult.reason, tool: toolName },
         });
 
-        latencyMs = Date.now() - start;
-        metrics.incCounter(METRIC.REQUEST_TOTAL, { tenant: request.tenantId, status: 'approval_required' });
+        metrics.incCounter(METRIC.REQUEST_TOTAL, {
+          tenant: request.tenantId,
+          status: 'approval_required',
+        });
         metrics.incCounter(METRIC.APPROVAL_PENDING, { tenant: request.tenantId });
-        metrics.observeHistogram(METRIC.REQUEST_LATENCY_MS, latencyMs, { tenant: request.tenantId });
+        metrics.observeHistogram(METRIC.REQUEST_LATENCY_MS, ms, { tenant: request.tenantId });
 
         logger.info(
           'Gateway request requires approval',
@@ -258,7 +274,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
             decision: 'approval_required',
             reason: evalResult.reason,
             approvalId,
-            latencyMs,
+            latencyMs: ms,
           }),
         );
 
@@ -269,17 +285,47 @@ export async function gatewayRoutes(app: FastifyInstance) {
           status: 'approval_required',
           reason: evalResult.reason,
           approvalId,
-          costEstimate: 0,
-          latencyMs,
+          latencyMs: ms,
         });
       }
 
-      // ── decision === 'allow': execute the tool ───────────────────────────
-      const toolExecResult = await executeTool({ toolName, toolArgs });
+      // ── ALLOW: execute the tool ───────────────────────────────────────────
+      let toolExecResult: Awaited<ReturnType<typeof executeTool>>;
+      try {
+        toolExecResult = await executeTool({ toolName, toolArgs });
+      } catch (err) {
+        // Tool execution failed — update the request to 'error' and write an
+        // audit log so the failure is visible in the dashboard and trace.
+        const ms = latencyMs();
+
+        await db
+          .update(schema.gatewayRequests)
+          .set({ status: 'error', latencyMs: ms, resolvedAt: new Date() })
+          .where(eq(schema.gatewayRequests.id, requestId));
+
+        await writeAuditLog(db, {
+          tenantId: request.tenantId,
+          requestId,
+          agentId,
+          action: 'tool.executed',
+          outcome: 'failure',
+          traceId,
+          detail: { tool: toolName, error: String(err) },
+        });
+
+        logger.error('Tool execution failed', {
+          traceId,
+          requestId,
+          tenantId: request.tenantId,
+          tool: toolName,
+          error: String(err),
+        });
+
+        throw err; // Let Fastify's error handler return 500 to the caller.
+      }
+
       const cost = estimateCost(toolName);
-      finalStatus = 'allowed';
-      latencyMs = Date.now() - start;
-      costEstimate = cost.costUsd;
+      const ms = latencyMs();
 
       await db
         .update(schema.gatewayRequests)
@@ -289,7 +335,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
           decisionReason: evalResult.reason,
           matchedPolicyId: evalResult.matchedPolicyId,
           toolResult: toolExecResult.data,
-          latencyMs,
+          latencyMs: ms,
           costEstimate: cost.costUsd,
           tokenCount: cost.inputTokens + cost.outputTokens,
           resolvedAt: new Date(),
@@ -324,8 +370,11 @@ export async function gatewayRoutes(app: FastifyInstance) {
       });
 
       metrics.incCounter(METRIC.REQUEST_TOTAL, { tenant: request.tenantId, status: 'allowed' });
-      metrics.incCounter(METRIC.TOOL_EXECUTIONS_TOTAL, { tenant: request.tenantId, tool: toolName });
-      metrics.observeHistogram(METRIC.REQUEST_LATENCY_MS, latencyMs, { tenant: request.tenantId });
+      metrics.incCounter(METRIC.TOOL_EXECUTIONS_TOTAL, {
+        tenant: request.tenantId,
+        tool: toolName,
+      });
+      metrics.observeHistogram(METRIC.REQUEST_LATENCY_MS, ms, { tenant: request.tenantId });
 
       logger.info(
         'Gateway request allowed and executed',
@@ -337,7 +386,7 @@ export async function gatewayRoutes(app: FastifyInstance) {
           agentId,
           toolName,
           decision: 'allow',
-          latencyMs,
+          latencyMs: ms,
           costEstimate: cost.costUsd,
         }),
       );
@@ -350,13 +399,13 @@ export async function gatewayRoutes(app: FastifyInstance) {
         reason: evalResult.reason,
         toolResult: toolExecResult.data,
         costEstimate: cost.costUsd,
-        latencyMs,
+        latencyMs: ms,
       });
     },
   );
 }
 
-async function writeAuditLog(
+export async function writeAuditLog(
   db: ReturnType<typeof getDb>,
   params: {
     tenantId: string;

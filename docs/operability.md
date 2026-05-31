@@ -1,14 +1,24 @@
-# Operability Guide
+# Operability
 
-## Observability
+## Health endpoints
 
-### Structured Logging
+| Endpoint | Purpose | What it checks |
+|---|---|---|
+| `GET /health` | Liveness — is the process running? | Always 200 if the server is up |
+| `GET /ready` | Readiness — can it serve traffic? | Runs `SELECT 1` against PostgreSQL |
+| `GET /metrics` | Prometheus scrape | In-process counters and histograms |
 
-Every request produces a structured JSON log line with fields that map directly to your log aggregator's query model:
+Kubernetes probes are pre-configured in the Helm chart values.
+
+---
+
+## Structured logging
+
+Every gateway event writes one JSON line to stdout. These are designed to be consumed by any log aggregator.
 
 ```json
 {
-  "time": "2024-05-30T10:23:45.123Z",
+  "time": "2025-05-30T10:23:45.123Z",
   "level": "info",
   "msg": "Gateway request allowed and executed",
   "event": "request.allowed",
@@ -20,143 +30,157 @@ Every request produces a structured JSON log line with fields that map directly 
   "tool_name": "lookup_customer",
   "decision": "allow",
   "latency_ms": 87,
-  "cost_estimate": 0.000012,
-  "schema_version": "1.0"
+  "cost_estimate": 0.000012
 }
 ```
 
-**Grafana Loki query to find all denied requests:**
+**Key query patterns**
+
 ```logql
-{service="pgag-api"} | json | decision = "deny"
+# Grafana Loki — all denied requests for a tenant
+{service="pgag-api"} | json | decision="deny" | tenant_id="tenant-acme-001"
+
+# Datadog — error rate by tool
+@event:request.* @decision:deny | stats count by @tool_name
+
+# CloudWatch Insights
+fields @timestamp, tenant_id, tool_name, decision, latency_ms
+| filter decision = "deny"
+| sort @timestamp desc
 ```
 
-**Datadog APM query:**
-```
-@event:request.denied @tenant_id:tenant-acme-001
-```
+---
 
-### Metrics
+## Metrics
 
-`GET /metrics` returns Prometheus-format text:
+`GET /metrics` returns Prometheus text format. Key metrics:
 
 ```
-# TYPE pgag_gateway_requests_total counter
-pgag_gateway_requests_total{tenant="tenant-acme-001",status="allowed"} 142
-pgag_gateway_requests_total{tenant="tenant-acme-001",status="denied"} 18
-pgag_gateway_requests_total{tenant="tenant-acme-001",status="approval_required"} 7
+# Request throughput by decision outcome
+pgag_gateway_requests_total{tenant,status}
 
-# TYPE pgag_gateway_request_duration_ms histogram
-pgag_gateway_request_duration_ms_bucket{tenant="tenant-acme-001",le="100"} 121
-pgag_gateway_request_duration_ms_sum{tenant="tenant-acme-001"} 11403
-pgag_gateway_request_duration_ms_count{tenant="tenant-acme-001"} 167
+# Latency distribution (histogram, ms)
+pgag_gateway_request_duration_ms{tenant}
 
-# TYPE pgag_policy_decisions_total counter
-pgag_policy_decisions_total{tenant="tenant-acme-001",decision="allow",tool="lookup_customer"} 142
+# Policy evaluation breakdown
+pgag_policy_decisions_total{tenant,decision,tool}
 
-# TYPE pgag_cost_usd_total counter
-pgag_cost_usd_total{tenant="tenant-acme-001"} 0.001847
+# Successful tool executions
+pgag_tool_executions_total{tenant,tool}
+
+# Approval queue depth (should stay near 0 in steady state)
+pgag_approvals_pending_total{tenant}
+
+# Rate limiter health (should always be 0 in production)
+pgag_ratelimiter_errors_total{tenant}
 ```
 
-**Connecting to Prometheus:**
+**Connecting to Prometheus**
+
 ```yaml
 # prometheus.yml
 scrape_configs:
-  - job_name: 'pgag-api'
+  - job_name: pgag
     static_configs:
       - targets: ['pgag-api:3000']
     metrics_path: /metrics
+    scrape_interval: 30s
 ```
 
-### Distributed Tracing
+**Recommended Grafana panels**
 
-The gateway propagates W3C `traceparent` headers. To enable full distributed tracing:
+- Request rate by decision (stacked bar: allow / deny / approval_required)
+- P99 latency per tenant
+- Approval queue depth over time
+- Cost per tenant per day
+- Rate limiter error count (alert if > 0 sustained)
+
+---
+
+## Distributed tracing
+
+The gateway reads and propagates W3C `traceparent` headers. Every log line carries the same `trace_id`, making it trivial to correlate logs, spans, and database records for a single request.
+
+**Enabling full span export (no code changes required)**
 
 ```bash
-npm install @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node \
-            @opentelemetry/exporter-trace-otlp-http
+pnpm add @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node \
+         @opentelemetry/exporter-trace-otlp-http
 ```
 
-Then create `src/tracing.ts` and import before server start:
+Create `src/tracing.ts` and import before `server.ts`:
 
 ```typescript
 import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 
-const sdk = new NodeSDK({
-  traceExporter: new OTLPTraceExporter({
-    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
-  }),
-});
-
-sdk.start();
+new NodeSDK({
+  traceExporter: new OTLPTraceExporter(),
+  instrumentations: [getNodeAutoInstrumentations()],
+}).start();
 ```
 
-The `trace_id` in every log line and the `traceparent` header in every response will automatically correlate with your OpenTelemetry spans.
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` in the environment. The `trace_id` in all log lines and DB records maps directly to the OTLP trace ID — no additional correlation needed.
 
-## Health Checks
-
-| Endpoint | Purpose | Returns |
-|---|---|---|
-| `GET /health` | Liveness — is the process up? | `{"status":"ok"}` |
-| `GET /ready` | Readiness — can it serve traffic? | `{"status":"ready","checks":{"database":"ok"}}` |
-| `GET /metrics` | Prometheus scrape | Text metrics |
-
-Kubernetes probe configuration is already included in the Helm chart.
-
-## Runbooks
-
-### High Error Rate
-
-```bash
-# Check recent errors
-curl http://pgag-api/v1/audit-logs?action=request.error | jq
-
-# Check DB connectivity
-curl http://pgag-api/ready
-
-# Tail structured logs
-kubectl logs -l app=pgag-api --tail=100 | jq 'select(.level=="error")'
-```
-
-### Pending Approvals Accumulating
-
-```bash
-# List pending approvals via API
-curl -H "X-API-Key: $API_KEY" http://pgag-api/v1/requests?status=approval_required
-
-# Bulk-approve via script (add to ops tooling, not run ad-hoc in production)
-```
-
-### Rate Limit False Positives
-
-Adjust `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW_MS` in environment config. Redis key pattern: `rl:{tenantId}:invoke`.
-
-### Database Migrations
-
-```bash
-# Run migrations (idempotent)
-pnpm db:migrate
-
-# In Kubernetes — run as a Job before deployment
-kubectl create job pgag-migrate --image=pgag-api -- node dist/db/migrate.js
-```
+---
 
 ## SLOs
 
-Recommended SLO targets for production:
+Recommended targets for a production deployment:
 
-| Metric | Target |
-|---|---|
-| Gateway P99 latency | < 500ms |
-| Availability | 99.9% |
-| Policy evaluation time | < 50ms |
-| Audit log write success | 100% |
-| Rate limit false positive rate | < 0.1% |
+| Metric | Target | Alert threshold |
+|---|---|---|
+| Gateway P99 latency | < 200ms | > 500ms for 5 min |
+| Availability | 99.9% | Any 5xx rate > 1% for 2 min |
+| Policy evaluation time | < 50ms | > 200ms for 2 min |
+| Audit log write success | 100% | Any failure → page |
+| Approval queue depth | < 10 pending | > 50 pending for 10 min |
+| Rate limiter error rate | 0 | Any sustained errors → alert |
 
-## Capacity Planning
+---
 
-At 100 req/s sustained:
-- PostgreSQL: ~200 writes/s (requests + audit logs + cost events) — single writer handles this easily
-- Redis: ~200 ops/s for rate limiting — negligible for Redis
-- API: ~100ms median latency → 2 replicas comfortably handle 100 req/s
-- Cost events: ~50 rows/min at typical approval rates
+## Runbooks
+
+**High error rate**
+```bash
+# Check recent errors
+curl -H "X-API-Key: $KEY" http://localhost:3000/v1/audit-logs?action=tool.executed | jq '.data[] | select(.outcome=="failure")'
+
+# Check DB connectivity
+curl http://localhost:3000/ready
+
+# Tail structured error logs
+docker compose logs api | grep '"level":"error"' | jq
+```
+
+**Approval queue growing**
+```bash
+# List pending approvals
+curl -H "X-API-Key: $KEY" http://localhost:3000/v1/requests?status=approval_required | jq '.data[] | {id, agentName, toolName, createdAt}'
+```
+
+**Rate limiting false positives**
+Adjust `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW_MS` in environment config. Current keys in Redis follow the pattern `rl:{tenantId}:invoke`.
+
+**Database migrations**
+```bash
+# Idempotent — safe to run multiple times
+pnpm db:migrate
+
+# Kubernetes — run as an init container or pre-deploy Job
+kubectl create job pgag-migrate --image=pgag-api:latest -- node dist/db/migrate.js
+```
+
+---
+
+## Capacity planning
+
+At sustained 100 req/s with 2 API replicas:
+
+| Resource | Load | Headroom |
+|---|---|---|
+| PostgreSQL writes | ~300 writes/s (requests + audit + cost) | Single writer handles ~5,000/s |
+| Redis ops | ~200 ops/s (rate limiting) | Negligible for Redis |
+| API CPU | ~10% per replica | Scales horizontally via HPA |
+| API memory | ~150 MB per replica | Static; no significant GC pressure |

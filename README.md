@@ -1,293 +1,263 @@
 # policy-governed-ai-gateway
 
-**An enterprise-grade AI agent control plane with policy enforcement, human-in-the-loop approval, audit logging, and cost tracking.**
+An AI agent control plane that enforces policy, requires human approval for high-risk operations, and writes an immutable audit trail for every tool call — before execution, not after.
 
-> Every tool call an autonomous agent makes passes through authentication, policy evaluation, and audit logging before being executed — or blocked. Built to demonstrate the backend engineering patterns required for production-grade AI infrastructure.
+> No paid API keys. No cloud account. Runs entirely on Docker Compose.
 
 ---
 
-## Why This Exists
+## The problem it solves
 
-Autonomous AI agents operating in enterprise environments need more than just an LLM API key. They need:
+Autonomous agents need to call real tools — CRM reads, financial transfers, outbound email. Organizations cannot grant unconstrained access. The gap between "agent has an API key" and "agent operates safely in production" is a control plane:
 
-- **Policy enforcement** — which agents can call which tools, under what conditions
-- **Audit trails** — immutable logs of every action, who approved it, and why
-- **Cost governance** — per-tenant token accounting and spend visibility
-- **Human oversight** — configurable approval gates for high-risk operations
-- **Tenant isolation** — complete separation of policy, data, and billing per customer
+- **Authentication** — which agent is calling, on behalf of which tenant?
+- **Policy enforcement** — is this agent allowed to call this tool, under these conditions?
+- **Human oversight** — some actions require a person to approve before execution
+- **Audit trail** — what happened, who decided, when, and why?
+- **Cost accounting** — how many tokens did each tenant's agents consume?
 
-This project implements a gateway that enforces all of the above, independent of which model or tool provider is behind it. Designed around the same patterns as production MCP gateway infrastructure, but runnable as a complete local demo with no paid API keys.
+This project implements that control plane as a standalone gateway service.
 
 ---
 
 ## Architecture
 
 ```
-Agent / Application
-        │
-        │  POST /v1/gateway/invoke
-        │  X-API-Key: {tenant-api-key}
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│                   Gateway API  (Fastify + TypeScript)      │
-│                                                           │
-│  ┌───────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │  Auth /   │  │  Rate Limit  │  │  Input Validation  │  │
-│  │  Tenant   │  │  (Redis)     │  │  (Zod)             │  │
-│  └─────┬─────┘  └──────┬───────┘  └─────────┬──────────┘  │
-│        └───────────────┴──────────────────┘               │
-│                          │                                │
-│                          ▼                                │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │               Policy Engine                         │  │
-│  │  (priority-sorted rules, fail-closed by default)   │  │
-│  │                                                    │  │
-│  │  requiredScope · maxAmount · allowList · denyList  │  │
-│  └────────────────────┬───────────────────────────────┘  │
-│                       │                                   │
-│         ┌─────────────┼─────────────┐                    │
-│         ▼             ▼             ▼                    │
-│      ALLOW          DENY     APPROVAL_REQUIRED           │
-│         │             │             │                    │
-│         ▼             │             ▼                    │
-│  Tool Executor        │      Approval Queue              │
-│  (mock / MCP)         │      (held until reviewed)       │
-│         │             │             │                    │
-│         └─────────────┴─────────────┘                    │
-│                          │                                │
-│                          ▼                                │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │   Audit Log · Cost Event · Metrics · Trace Context  │  │
-│  └────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────┘
-                          │
-                ┌─────────┴──────────┐
-                │                    │
-          PostgreSQL              Redis
-          (persistent store)   (rate limiting)
-                │
-                ▼
-        React Dashboard
-        • Request list + decision badges
-        • Approval action panel
-        • Audit log viewer
-        • Policy browser
-        • Cost tracking
+┌─────────────────────────────────────────────────────────────────┐
+│                        Agent / Application                       │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │  POST /v1/gateway/invoke
+                               │  X-API-Key: {tenant-key}
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Gateway API  (Fastify)                        │
+│                                                                  │
+│   authenticate → rate-limit → validate → resolve-agent           │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │                   Policy Engine                           │  │
+│   │   priority-sorted rules · fail-closed default            │  │
+│   │   conditions: scope · amount · allowlist · blocklist      │  │
+│   └────────────────────┬─────────────────────────────────────┘  │
+│                        │                                         │
+│          ┌─────────────┼──────────────┐                          │
+│        allow         deny      approval_required                 │
+│          │             │              │                          │
+│   execute tool     log & block    hold for review                │
+│          │             │              │                          │
+│          └─────────────┴──────────────┘                          │
+│                        │                                         │
+│          audit log · cost event · metrics · trace                │
+└──────────────────────────────────────────────────────────────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │                     │
+               PostgreSQL              Redis
+               (state + audit)      (rate limiting)
+                    │
+                    ▼
+            React Dashboard
+            requests · approvals · audit · policies
 ```
 
----
+**Request lifecycle**
 
-## Request Lifecycle
-
-| Step | Component | What happens |
-|------|-----------|-------------|
-| 1 | API | Receive `POST /v1/gateway/invoke` |
-| 2 | Auth middleware | Validate `X-API-Key`, attach tenant context |
-| 3 | Rate limiter | Redis sliding-window check per tenant |
-| 4 | Validator | Zod schema — reject malformed requests immediately |
-| 5 | Agent lookup | Resolve agentId, enforce tenant isolation |
-| 6 | DB write | Insert `gateway_requests` row with `status=pending` |
-| 7 | Policy engine | Evaluate all enabled tenant policies, priority-ordered |
-| 8a | allow | Execute mock tool, record cost event, return 200 |
-| 8b | deny | Skip execution, write audit log, return 403 |
-| 8c | approval_required | Create `approvals` row, return 202, pause execution |
-| 9 | Audit | Write `audit_logs` row for every state transition |
-| 10 | Metrics | Increment Prometheus counters and histograms |
+| Step | What happens |
+|---|---|
+| Auth | API key validated against `tenants` table; tenant context attached |
+| Rate limit | Redis sliding-window per tenant per endpoint (RFC 6585 headers set) |
+| Validate | Zod schema; prototype-polluting keys (`__proto__` etc.) stripped |
+| Agent resolve | `agentId` checked against `agents` table with tenant isolation |
+| Write pending | `gateway_requests` row inserted with `status=pending` before evaluation |
+| Policy evaluate | All tenant policies loaded, sorted by priority desc, conditions gated |
+| Branch | `allow` → execute · `deny` → block · `approval_required` → hold |
+| Audit | `audit_logs` row written for every state transition |
+| Metrics | Prometheus counters and histograms updated |
 
 ---
 
-## Policy Engine
+## Policy engine
 
-Policies are JSON documents stored per tenant. The engine evaluates them in descending priority order. The first matching policy wins. **Default action is deny (fail-closed).**
+Policies are per-tenant JSON rules evaluated in priority order. **If no policy matches, the default is deny.** The first policy whose conditions all pass determines the outcome.
 
-### Example policies
+```jsonc
+// Allow — CRM reads for agents with the right scope
+{
+  "toolName": "lookup_customer",
+  "requiredScope": "crm:read",
+  "decision": "allow",
+  "reason": "CRM read access permitted",
+  "priority": 10
+}
 
-```json
-[
-  {
-    "name": "Allow CRM reads",
-    "toolName": "lookup_customer",
-    "requiredScope": "crm:read",
-    "decision": "allow",
-    "reason": "CRM read access permitted for agents with crm:read scope",
-    "priority": 10
-  },
-  {
-    "name": "Block high-value wire transfers",
-    "toolName": "wire_transfer",
-    "maxAmount": 10000,
-    "decision": "deny",
-    "reason": "Transfers above $10,000 require Finance VP approval",
-    "priority": 30
-  },
-  {
-    "name": "Require approval for outbound email",
-    "toolName": "send_email",
-    "requiredScope": "comms:send",
-    "decision": "approval_required",
-    "reason": "All outbound email requires human review before delivery",
-    "priority": 10
-  }
-]
+// Deny — block high-value transfers regardless of scope
+{
+  "toolName": "wire_transfer",
+  "maxAmount": 10000,
+  "decision": "deny",
+  "reason": "Transfers above $10,000 blocked by security policy",
+  "priority": 30
+}
+
+// Approval required — hold outbound email for human review
+{
+  "toolName": "send_email",
+  "requiredScope": "comms:send",
+  "decision": "approval_required",
+  "reason": "All outbound email requires human review before delivery",
+  "priority": 10
+}
 ```
 
-### Supported conditions
-
-| Field | Type | Behavior |
-|-------|------|----------|
-| `toolName` | string | Exact tool name match |
-| `requiredScope` | string | Agent's `scopes[]` must include this |
-| `maxAmount` | number | `toolArgs.amount` must be ≤ this value |
-| `allowedAgentIds` | string[] | Agent must be in this list |
-| `blockedAgentIds` | string[] | Agent must NOT be in this list |
-| `priority` | number | Higher wins; evaluated descending |
-| `enabled` | boolean | Disabled policies are skipped entirely |
+Supported conditions: `requiredScope` · `maxAmount` · `allowedAgentIds` · `blockedAgentIds` · `priority` · `enabled`
 
 ---
 
-## Demo Scenarios
+## Demo scenarios
 
-### Scenario 1: Allowed ✅
+### 1 — Allowed ✅
 
-**SalesBot** calls `lookup_customer`. It has `crm:read` scope. Policy matches and allows execution. Gateway returns customer data and records $0.000012 cost.
-
-### Scenario 2: Denied 🚫
-
-**FinanceBot** calls `wire_transfer` with `amount: 5000`. It only has `finance:read` scope — the policy requires `finance:write`. Gateway returns HTTP 403. No tool is executed. Audit log records the denial reason.
-
-### Scenario 3: Approval Required ⏳
-
-**MarketingBot** calls `send_email`. Policy evaluates to `approval_required`. Gateway returns HTTP 202 with an `approvalId`. An operator reviews the request in the dashboard and clicks Approve — the gateway then executes the tool, records cost, and completes the audit chain.
-
----
-
-## Local Setup
-
-### Prerequisites
-
-- Docker + Docker Compose
-- Node.js 20+
-- pnpm 9+
+**SalesBot** (`scopes: [crm:read]`) calls `lookup_customer`. Policy allows it.
 
 ```bash
-# 1. Clone
+curl -s -X POST http://localhost:3000/v1/gateway/invoke \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: demo-tenant-key-acme" \
+  -d '{"agentId":"agent-sales-001","toolName":"lookup_customer","toolArgs":{"customer_id":"cust-42"}}' \
+  | jq '{decision, status, toolResult, costEstimate, latencyMs}'
+```
+
+```json
+{
+  "decision": "allow",
+  "status": "allowed",
+  "toolResult": { "name": "Elara Voss", "plan": "enterprise", "mrr_usd": 4800 },
+  "costEstimate": 0.000012,
+  "latencyMs": 87
+}
+```
+
+### 2 — Denied 🚫
+
+**FinanceBot** (`scopes: [finance:read]`) calls `wire_transfer`. Requires `finance:write`. Blocked.
+
+```bash
+curl -s -X POST http://localhost:3000/v1/gateway/invoke \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: demo-tenant-key-acme" \
+  -d '{"agentId":"agent-finance-001","toolName":"wire_transfer","toolArgs":{"amount":5000,"account":"ACC-999"}}' \
+  | jq '{decision, status, reason}'
+```
+
+```json
+{
+  "decision": "deny",
+  "status": "denied",
+  "reason": "Agent lacks required scope 'finance:write' for tool 'wire_transfer'."
+}
+```
+
+### 3 — Approval required ⏳
+
+**MarketingBot** calls `send_email`. Policy requires human review before delivery.
+
+```bash
+# Step 1: invoke — returns 202 with approvalId
+RESP=$(curl -s -X POST http://localhost:3000/v1/gateway/invoke \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: demo-tenant-key-acme" \
+  -d '{"agentId":"agent-marketing-001","toolName":"send_email","toolArgs":{"to":"vip@acme.com","subject":"Q2 Promo","body":"Hello"}}')
+
+APPROVAL_ID=$(echo $RESP | jq -r '.approvalId')
+
+# Step 2: approve from dashboard or API — executes the tool and writes full audit chain
+curl -s -X POST http://localhost:3000/v1/approvals/$APPROVAL_ID/approve \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: demo-tenant-key-acme" \
+  -d '{"comment": "Reviewed and approved"}' | jq '{status, toolResult}'
+```
+
+---
+
+## Local setup
+
+**Prerequisites:** Docker, Node.js ≥ 20, pnpm ≥ 9
+
+```bash
 git clone https://github.com/your-username/policy-governed-ai-gateway
 cd policy-governed-ai-gateway
 
-# 2. Configure
-cp .env.example .env        # defaults work for local dev
+cp .env.example .env                   # defaults work as-is
 
-# 3. Install
 pnpm install
+pnpm docker:up                         # starts Postgres + Redis, waits for health checks
+pnpm db:migrate                        # applies schema
+pnpm db:seed                           # loads demo tenants, agents, and policies
 
-# 4. Start infrastructure (Postgres + Redis)
-pnpm docker:up
-
-# 5. Run migrations
-pnpm db:migrate
-
-# 6. Seed demo data
-pnpm db:seed
-
-# 7. Start API (hot reload)
-pnpm --filter @pgag/api dev
-
-# 8. Start dashboard
-pnpm --filter @pgag/web dev
+pnpm --filter @pgag/api dev            # API at :3000
+pnpm --filter @pgag/web dev            # Dashboard at :5173
 ```
 
-Dashboard: http://localhost:5173 · API: http://localhost:3000
-
-### One-command Docker Compose
+Or with Docker Compose for everything:
 
 ```bash
 pnpm docker:up
-# API at :3000, Dashboard at :5173
+# API at :3000  ·  Dashboard at :5173
 ```
 
 ---
 
-## API Examples
+## API reference
 
 ```bash
 export KEY="demo-tenant-key-acme"
 export API="http://localhost:3000"
 
-# Scenario 1 — Allowed
-curl -s -X POST $API/v1/gateway/invoke \
-  -H "Content-Type: application/json" -H "X-API-Key: $KEY" \
-  -d '{"agentId":"agent-sales-001","toolName":"lookup_customer","toolArgs":{"customer_id":"cust-42"}}' | jq
+# Invoke the gateway
+POST  $API/v1/gateway/invoke          -H "X-API-Key: $KEY"
 
-# Scenario 2 — Denied
-curl -s -X POST $API/v1/gateway/invoke \
-  -H "Content-Type: application/json" -H "X-API-Key: $KEY" \
-  -d '{"agentId":"agent-finance-001","toolName":"wire_transfer","toolArgs":{"amount":5000,"account":"ACC-999"}}' | jq
+# Read requests
+GET   $API/v1/requests                -H "X-API-Key: $KEY"
+GET   $API/v1/requests/:id            -H "X-API-Key: $KEY"
 
-# Scenario 3 — Approval required → approve
-RESP=$(curl -s -X POST $API/v1/gateway/invoke \
-  -H "Content-Type: application/json" -H "X-API-Key: $KEY" \
-  -d '{"agentId":"agent-marketing-001","toolName":"send_email","toolArgs":{"to":"vip@acme.com","subject":"Promo","body":"Hello"}}')
-APPROVAL_ID=$(echo $RESP | jq -r '.approvalId')
-curl -s -X POST $API/v1/approvals/$APPROVAL_ID/approve \
-  -H "Content-Type: application/json" -H "X-API-Key: $KEY" \
-  -d '{"comment":"Looks good"}' | jq
+# Approvals
+POST  $API/v1/approvals/:id/approve   -H "X-API-Key: $KEY"
+POST  $API/v1/approvals/:id/deny      -H "X-API-Key: $KEY"
 
-# Management
-curl -H "X-API-Key: $KEY" $API/v1/requests | jq '.data[0]'
-curl -H "X-API-Key: $KEY" $API/v1/audit-logs | jq '.data[].action'
-curl -H "X-API-Key: $KEY" $API/v1/policies | jq '.data[].name'
-curl $API/health
-curl $API/metrics
+# Audit and policy
+GET   $API/v1/audit-logs              -H "X-API-Key: $KEY"
+GET   $API/v1/policies                -H "X-API-Key: $KEY"
+POST  $API/v1/policies                -H "X-API-Key: $KEY"
+
+# Observability (no auth required)
+GET   $API/health
+GET   $API/ready
+GET   $API/metrics                    # Prometheus text format
 ```
-
----
-
-## Screenshots
-
-> _Capture these after running the demo scenarios._
-
-| File | What to show |
-|---|---|
-| `screenshots/01-request-list.png` | Request list with all three decision badge colors |
-| `screenshots/02-denied-detail.png` | Request detail for the denied wire_transfer |
-| `screenshots/03-approval-panel.png` | Approval action card for the pending send_email |
-| `screenshots/04-audit-trail.png` | Full audit log chain for an approved request |
-| `screenshots/05-policies.png` | Policy browser with priorities and conditions |
-| `screenshots/06-metrics.png` | Raw `/metrics` Prometheus output |
 
 ---
 
 ## Testing
 
 ```bash
-# All tests
-pnpm test
-
-# Policy engine only (no DB dependency)
-pnpm --filter @pgag/policy-engine test
-
-# API tests
-pnpm --filter @pgag/api test
+pnpm test                             # all packages
+pnpm --filter @pgag/policy-engine test  # policy engine only (no DB)
+pnpm --filter @pgag/api test            # API unit tests
 ```
 
-Test coverage:
-- Policy allow / deny / approval_required decisions
-- Tenant isolation (cross-tenant policy leakage)
-- Amount threshold enforcement
-- Priority ordering (higher-priority policy wins)
-- Fail-closed default (no matching policy → deny)
-- Cost estimator positive values for known and unknown tools
-- Invalid request rejection
+**What's covered:** allow / deny / approval\_required decisions · tenant isolation (cross-tenant policy leakage) · amount threshold enforcement · priority ordering · fail-closed default · cost estimator · invalid request rejection
 
 ---
 
 ## Observability
 
-### Structured logs (JSON)
+### Structured logs
+
+Every request emits one JSON line to stdout:
 
 ```json
 {
-  "time": "2024-05-30T10:23:45.123Z",
+  "time": "2025-05-30T10:23:45.123Z",
   "level": "info",
   "event": "request.allowed",
   "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -300,20 +270,22 @@ Test coverage:
 }
 ```
 
+Pipe to Datadog, Grafana Loki, or CloudWatch Logs. The `trace_id` field maps 1:1 to W3C traceparent trace IDs.
+
 ### Prometheus metrics (`GET /metrics`)
 
 ```
-pgag_gateway_requests_total{tenant="...",status="allowed"} 142
-pgag_gateway_request_duration_ms_count{tenant="..."} 167
-pgag_policy_decisions_total{decision="deny",tool="wire_transfer"} 18
-pgag_cost_usd_total{tenant="..."} 0.001847
+pgag_gateway_requests_total{tenant,status}          request throughput by decision
+pgag_gateway_request_duration_ms                    latency histogram
+pgag_policy_decisions_total{tenant,decision,tool}   policy evaluation breakdown
+pgag_tool_executions_total{tenant,tool}             successful tool executions
+pgag_approvals_pending_total{tenant}                approval queue depth
+pgag_ratelimiter_errors_total{tenant}               Redis failures (should be 0)
 ```
 
 ### Distributed tracing
 
-Gateway propagates W3C `traceparent` headers. Wire in `@opentelemetry/sdk-node` + OTLP exporter to send spans to Jaeger, Grafana Tempo, or Datadog APM. The `trace_id` in every log line maps 1:1 to OTLP trace IDs.
-
-See [`docs/operability.md`](docs/operability.md) for Prometheus, Loki, and OTel integration examples.
+The gateway reads the incoming W3C `traceparent` header and propagates `trace_id` through every log line and DB record. To enable full span export, add `@opentelemetry/sdk-node` with an OTLP exporter pointed at `OTEL_EXPORTER_OTLP_ENDPOINT` — no other code changes needed. See [`docs/operability.md`](docs/operability.md).
 
 ---
 
@@ -326,77 +298,83 @@ helm install pgag ./deploy/helm/policy-governed-ai-gateway \
   --namespace pgag --create-namespace
 ```
 
-Chart includes: HPA (2–10 replicas), non-root security context, liveness/readiness probes, ServiceMonitor for Prometheus Operator, Ingress with TLS via cert-manager, Bitnami PostgreSQL + Redis subcharts.
-
-See [`deploy/helm/policy-governed-ai-gateway/values.yaml`](deploy/helm/policy-governed-ai-gateway/values.yaml).
+The chart includes HPA (2–10 replicas at 70% CPU), non-root pod security context, liveness/readiness probes wired to `/health` and `/ready`, ServiceMonitor for Prometheus Operator, TLS via cert-manager, and Bitnami PostgreSQL + Redis subcharts.
 
 ---
 
-## Security Model
+## Security model
 
-| Concern | Current implementation |
-|---|---|
-| Authentication | Per-tenant API key (`X-API-Key` header) |
-| Tenant isolation | All queries filter by `tenant_id` |
-| RBAC | `users.role` — admin / operator / viewer |
-| Fail-closed policy | No matching policy → deny |
-| Audit immutability | Append-only `audit_logs` table |
-| Rate limiting | Redis sliding-window per tenant |
-| Input validation | Zod schema on all endpoints |
-| No secrets in repo | `.env.example` only; `.env` in `.gitignore` |
+| Concern | Implementation | Production upgrade |
+|---|---|---|
+| Authentication | Per-tenant API key (`X-API-Key`) | JWT/OIDC short-lived tokens |
+| Tenant isolation | All queries filter by `tenant_id` | Per-tenant DB schemas |
+| Policy default | Fail-closed: no match → deny | — |
+| Input sanitization | Zod validation + `__proto__` key stripping | — |
+| Audit integrity | Append-only `audit_logs` table | S3 + Object Lock + KMS signing |
+| Rate limiting | Redis sliding-window; fail-open with log | Fail-closed for high-security |
+| Secrets | `.env.example` only; `.env` in `.gitignore` | Vault / External Secrets Operator |
+| RBAC | `users.role` stored (admin/operator/viewer) | Route-level enforcement |
 
-See [`docs/security-model.md`](docs/security-model.md) for full threat model and production hardening checklist.
-
----
-
-## What I Would Add for Production
-
-1. **JWT / OIDC authentication** — Short-lived tokens via Auth0 or Keycloak, API keys for M2M only
-2. **Full RBAC enforcement** — Route-level permission checks against `user.role`
-3. **MCP transport** — Replace the mock executor with a real MCP client (stdio / SSE sessions to tool servers)
-4. **Streaming approvals** — SSE for real-time notifications without polling
-5. **Policy-as-code** — Git-backed policies, CI validation, GitOps operator
-6. **Per-tenant DB schemas** — Strong data isolation guarantees
-7. **Immutable audit streaming** — S3 + Object Lock with KMS batch signing
-8. **Full OpenTelemetry SDK** — Replace lightweight trace context with OTLP export
-9. **Cost budget enforcement** — Block requests when monthly spend exceeds threshold
-10. **Anomaly detection** — Alert on unusual agent behavior patterns
+See [`docs/security-model.md`](docs/security-model.md) for threat model and production hardening checklist.
 
 ---
 
-## Why This Is Relevant to Enterprise AI Gateways
+## What I would add for production
 
-Autonomous AI agents in enterprise deployments need access to real business tools — CRM, ERP, finance systems — but organizations cannot grant unconstrained access. The missing layer is a **control plane** that:
+**Near-term (would ship before first paying customer)**
+- JWT/OIDC authentication with short-lived tokens
+- `db.transaction()` wrapping multi-step approval writes
+- Full RBAC enforcement on every route (not just stored roles)
+- SSE endpoint for real-time approval notifications
 
-1. Authenticates and identifies every agent by tenant and scope
-2. Enforces least-privilege access via configurable policies
-3. Gates high-risk operations behind human approval
-4. Provides an immutable audit trail for compliance and forensics
-5. Tracks per-tenant token usage and cost for billing
+**Medium-term (first enterprise contract)**
+- MCP transport layer — replace mock executor with real MCP client (stdio/SSE)
+- Policy-as-code — Git-backed rules, CI validation, GitOps operator
+- Per-tenant DB schema isolation
+- Audit log streaming to append-only sink (S3 + Object Lock)
 
-This is the core problem MCP gateway products are solving today. The patterns here — tenant isolation, fail-closed policy evaluation, human-in-the-loop approval queues, append-only audit logs — are the same patterns that appear in enterprise IAM, financial transaction processors, and ML inference proxies. They transfer directly to production AI infrastructure.
+**Longer-term**
+- Full OpenTelemetry SDK with OTLP export
+- Cost budgets — block requests when tenant monthly spend exceeds threshold
+- Behavioral anomaly detection — alert on unusual agent call patterns
 
 ---
 
-## Repository Structure
+## Why this matters for enterprise AI gateways
+
+The same three invariants that govern financial transaction processors, cloud IAM systems, and ML inference proxies apply here:
+
+1. **Authorization happens at the gateway, not in the agent** — agents should not be trusted to enforce their own constraints
+2. **Every action leaves an immutable record** — compliance requires being able to reconstruct exactly what an agent did and why it was permitted
+3. **High-risk operations require a human in the loop** — autonomous systems need defined escalation paths before executing irreversible actions
+
+This project is a working demonstration of all three, built with the same architectural patterns (tenant isolation, policy engine separation, append-only audit, cost accounting) that appear in production AI infrastructure.
+
+---
+
+## Repository structure
 
 ```
-policy-governed-ai-gateway/
+.
 ├── apps/
-│   ├── api/                    # Fastify API server
-│   │   ├── src/db/             # Drizzle ORM schema + migrations + seed
-│   │   ├── src/middleware/     # Auth, tenant context
-│   │   ├── src/routes/         # gateway, requests, audit, policies, approvals, health
-│   │   ├── src/services/       # tool-executor, cost-estimator, rate-limiter, telemetry
-│   │   └── tests/              # Vitest unit tests
-│   └── web/                    # React + Vite dashboard
+│   ├── api/                      Fastify gateway server
+│   │   ├── src/db/               Drizzle ORM schema, migrations, seed
+│   │   ├── src/middleware/       Auth, tenant context
+│   │   ├── src/routes/           gateway · requests · audit · policies · approvals · health
+│   │   ├── src/services/         tool-executor · cost-estimator · rate-limiter · telemetry
+│   │   └── tests/                Vitest unit tests
+│   └── web/                      React + Vite dashboard
+│       └── src/
+│           ├── api/              API client
+│           ├── components/       RequestList · RequestDetail · DecisionBadge · DemoPanel
+│           └── pages/            AuditPage · PoliciesPage
 ├── packages/
-│   ├── policy-engine/          # Pure policy evaluator (no I/O, fully testable)
-│   └── shared/                 # TypeScript types shared across packages
+│   ├── policy-engine/            Pure policy evaluator — no I/O, fully unit-tested
+│   └── shared/                   TypeScript types shared across packages
 ├── deploy/
 │   ├── docker-compose.yml
-│   ├── Dockerfile.api / Dockerfile.web
-│   └── helm/policy-governed-ai-gateway/   # Helm chart skeleton
+│   ├── Dockerfile.api / .web
+│   └── helm/                     Kubernetes Helm chart
 └── docs/
     ├── architecture.md
     ├── security-model.md
@@ -406,16 +384,15 @@ policy-governed-ai-gateway/
 
 ---
 
-## Tech Stack
+## Tech stack
 
-| Layer | Technology |
+| | |
 |---|---|
-| API framework | Fastify 4 + TypeScript |
-| Database | PostgreSQL 16 + Drizzle ORM |
-| Cache / rate limiting | Redis 7 |
-| Policy engine | Custom TypeScript, zero runtime dependencies |
-| Frontend | React 18 + Vite + React Router |
-| Testing | Vitest |
-| Containerization | Docker + Docker Compose |
-| Kubernetes | Helm chart skeleton |
-| Observability | Structured JSON logs · Prometheus metrics · W3C trace context |
+| API | Fastify 4 · TypeScript · Node.js 20 |
+| Database | PostgreSQL 16 · Drizzle ORM |
+| Cache | Redis 7 |
+| Policy engine | TypeScript · zero runtime dependencies |
+| Frontend | React 18 · Vite · React Router |
+| Tests | Vitest · 22 tests |
+| Infrastructure | Docker Compose · Helm chart skeleton |
+| Observability | JSON structured logs · Prometheus metrics · W3C trace context |

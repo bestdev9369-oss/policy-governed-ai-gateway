@@ -1,4 +1,4 @@
-import type { FastifyRequest, FastifyReply, FastifyInstance } from 'fastify';
+import type { FastifyRequest, FastifyReply } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { getDb, schema } from '../db/index.js';
 import { logger } from '../logger.js';
@@ -12,21 +12,20 @@ declare module 'fastify' {
 }
 
 /**
- * API key authentication middleware.
+ * API key authentication — validates X-API-Key and attaches tenant context.
  *
- * Tenants authenticate by passing their API key in the X-API-Key header.
- * In production, use short-lived JWT tokens issued by an OIDC provider, with
- * API keys only for machine-to-machine service accounts.
+ * Production upgrade path: replace with short-lived JWT tokens issued by an
+ * OIDC provider (Auth0, Keycloak). API keys then become M2M service accounts
+ * only, hashed at rest with Argon2.
  */
 export async function authenticate(request: FastifyRequest, reply: FastifyReply) {
   const apiKey = request.headers['x-api-key'];
 
   if (!apiKey || typeof apiKey !== 'string') {
-    reply.status(401).send({
+    return reply.status(401).send({
       code: 'MISSING_API_KEY',
       message: 'X-API-Key header is required',
     });
-    return;
   }
 
   const db = getDb();
@@ -38,12 +37,13 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
     .limit(1);
 
   if (!tenant) {
-    logger.warn('Authentication failed: invalid API key', { apiKey: apiKey.slice(0, 8) + '...' });
-    reply.status(401).send({
+    logger.warn('Authentication failed: invalid API key', {
+      apiKey: apiKey.slice(0, 8) + '...',
+    });
+    return reply.status(401).send({
       code: 'INVALID_API_KEY',
       message: 'API key is invalid or has been revoked',
     });
-    return;
   }
 
   request.tenantId = tenant.id;
@@ -52,15 +52,15 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
 }
 
 /**
- * Admin-only routes — tenant admin users only.
- * For demo purposes, the admin key is fixed in .env.
+ * Admin guard — must be chained after `authenticate`.
+ * Checks that the caller holds the designated admin API key.
  */
 export async function requireAdmin(request: FastifyRequest, reply: FastifyReply) {
   const adminKey = process.env['SEED_ADMIN_API_KEY'];
-  const apiKey = request.headers['x-api-key'];
 
-  if (!adminKey || apiKey !== adminKey) {
-    reply.status(403).send({
+  if (!adminKey || request.headers['x-api-key'] !== adminKey) {
+    // Return is critical here — without it Fastify continues into the route handler
+    return reply.status(403).send({
       code: 'FORBIDDEN',
       message: 'Admin access required',
     });
