@@ -24,31 +24,31 @@ This project implements that control plane as a standalone gateway service.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Agent / Application                       │
+│                        Agent / Application                      │
 └──────────────────────────────┬──────────────────────────────────┘
                                │  POST /v1/gateway/invoke
                                │  X-API-Key: {tenant-key}
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Gateway API  (Fastify)                        │
-│                                                                  │
-│   authenticate → rate-limit → validate → resolve-agent           │
-│                                                                  │
+│                     Gateway API  (Fastify)                      │
+│                                                                 │
+│   authenticate → rate-limit → validate → resolve-agent          │
+│                                                                 │
 │   ┌──────────────────────────────────────────────────────────┐  │
-│   │                   Policy Engine                           │  │
+│   │                   Policy Engine                          │  │
 │   │   priority-sorted rules · fail-closed default            │  │
-│   │   conditions: scope · amount · allowlist · blocklist      │  │
+│   │   conditions: scope · amount · allowlist · blocklist     │  │
 │   └────────────────────┬─────────────────────────────────────┘  │
-│                        │                                         │
-│          ┌─────────────┼──────────────┐                          │
-│        allow         deny      approval_required                 │
-│          │             │              │                          │
-│   execute tool     log & block    hold for review                │
-│          │             │              │                          │
-│          └─────────────┴──────────────┘                          │
-│                        │                                         │
-│          audit log · cost event · metrics · trace                │
-└──────────────────────────────────────────────────────────────────┘
+│                        │                                        │
+│          ┌─────────────┼──────────────┐                         │
+│        allow         deny      approval_required                │
+│          │             │              │                         │
+│   execute tool     log & block    hold for review               │
+│          │             │              │                         │
+│          └─────────────┴──────────────┘                         │
+│                        │                                        │
+│          audit log · cost event · metrics · trace               │
+└─────────────────────────────────────────────────────────────────┘
                                │
                     ┌──────────┴──────────┐
                     │                     │
