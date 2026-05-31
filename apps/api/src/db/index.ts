@@ -7,6 +7,11 @@ const { Pool } = pkg;
 let _db: ReturnType<typeof drizzle> | null = null;
 let _pool: InstanceType<typeof Pool> | null = null;
 
+/** Override the database instance — used by the standalone dev server (pg-mem). */
+export function injectDb(db: ReturnType<typeof drizzle>) {
+  _db = db;
+}
+
 export function getDb() {
   if (!_db) {
     _pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
