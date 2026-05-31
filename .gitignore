@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+*.js.map
+*.d.ts.map
+coverage/
+.turbo/
+*.log
+.DS_Store
+Thumbs.db
+pnpm-lock.yaml.bak
+drizzle/
+*.sqlite

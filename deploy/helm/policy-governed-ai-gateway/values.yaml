@@ -1,0 +1,134 @@
+# ─── Global ───────────────────────────────────────────────────────────────────
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# ─── API ──────────────────────────────────────────────────────────────────────
+api:
+  replicaCount: 2
+
+  image:
+    repository: your-registry/pgag-api
+    pullPolicy: IfNotPresent
+    tag: "0.1.0"
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  env:
+    NODE_ENV: production
+    LOG_LEVEL: info
+    RATE_LIMIT_MAX: "100"
+    RATE_LIMIT_WINDOW_MS: "60000"
+
+  # Secret values — provide via external-secrets or sealed-secrets in production
+  secrets:
+    databaseUrl: ""   # Set via secret: pgag-db-url
+    redisUrl: ""      # Set via secret: pgag-redis-url
+    jwtSecret: ""     # Set via secret: pgag-jwt-secret
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 3000
+    initialDelaySeconds: 15
+    periodSeconds: 10
+
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 3000
+    initialDelaySeconds: 10
+    periodSeconds: 5
+
+# ─── Web ──────────────────────────────────────────────────────────────────────
+web:
+  replicaCount: 1
+
+  image:
+    repository: your-registry/pgag-web
+    pullPolicy: IfNotPresent
+    tag: "0.1.0"
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# ─── Ingress ──────────────────────────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+  hosts:
+    - host: pgag.example.com
+      paths:
+        - path: /v1
+          pathType: Prefix
+          backend: api
+        - path: /
+          pathType: Prefix
+          backend: web
+  tls:
+    - secretName: pgag-tls
+      hosts:
+        - pgag.example.com
+
+# ─── PostgreSQL (Bitnami subchart) ────────────────────────────────────────────
+postgresql:
+  enabled: true
+  auth:
+    database: pgag
+    username: pgag
+    existingSecret: pgag-postgres-secret
+  primary:
+    persistence:
+      enabled: true
+      size: 20Gi
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+
+# ─── Redis (Bitnami subchart) ─────────────────────────────────────────────────
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false
+  master:
+    persistence:
+      enabled: true
+      size: 2Gi
+
+# ─── ServiceMonitor (Prometheus Operator) ─────────────────────────────────────
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  path: /metrics
+  labels:
+    release: prometheus

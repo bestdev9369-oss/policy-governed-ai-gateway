@@ -1,0 +1,16 @@
+apiVersion: v2
+name: policy-governed-ai-gateway
+description: Enterprise AI gateway with policy enforcement, audit logging, and agent governance
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - ai
+  - gateway
+  - mcp
+  - policy
+  - agents
+home: https://github.com/your-username/policy-governed-ai-gateway
+maintainers:
+  - name: Platform Engineering
+    email: platform@example.com

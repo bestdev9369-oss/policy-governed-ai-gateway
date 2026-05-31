@@ -1,0 +1,41 @@
+FROM node:20-alpine AS base
+RUN corepack enable && corepack prepare pnpm@latest --activate
+WORKDIR /app
+
+# Install dependencies
+FROM base AS deps
+COPY package.json pnpm-workspace.yaml ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/policy-engine/package.json ./packages/policy-engine/
+COPY apps/api/package.json ./apps/api/
+RUN pnpm install --frozen-lockfile
+
+# Build
+FROM deps AS build
+COPY tsconfig.base.json ./
+COPY packages/shared ./packages/shared
+COPY packages/policy-engine ./packages/policy-engine
+COPY apps/api ./apps/api
+RUN pnpm --filter @pgag/shared build && \
+    pnpm --filter @pgag/policy-engine build && \
+    pnpm --filter @pgag/api build
+
+# Production image
+FROM node:20-alpine AS prod
+RUN corepack enable && corepack prepare pnpm@latest --activate
+WORKDIR /app
+
+COPY package.json pnpm-workspace.yaml ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/policy-engine/package.json ./packages/policy-engine/
+COPY apps/api/package.json ./apps/api/
+
+RUN pnpm install --prod --frozen-lockfile
+
+COPY --from=build /app/packages/shared/dist ./packages/shared/dist
+COPY --from=build /app/packages/policy-engine/dist ./packages/policy-engine/dist
+COPY --from=build /app/apps/api/dist ./apps/api/dist
+
+ENV NODE_ENV=production
+EXPOSE 3000
+CMD ["node", "apps/api/dist/index.js"]

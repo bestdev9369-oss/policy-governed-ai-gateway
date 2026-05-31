@@ -1,0 +1,34 @@
+{
+  "name": "policy-governed-ai-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Enterprise AI gateway with policy enforcement, audit logging, and agent governance",
+  "scripts": {
+    "dev": "pnpm --filter @pgag/api dev & pnpm --filter @pgag/web dev",
+    "build": "pnpm --recursive build",
+    "test": "pnpm --recursive test",
+    "test:api": "pnpm --filter @pgag/api test",
+    "test:policy": "pnpm --filter @pgag/policy-engine test",
+    "lint": "pnpm --recursive lint",
+    "db:generate": "pnpm --filter @pgag/api db:generate",
+    "db:migrate": "pnpm --filter @pgag/api db:migrate",
+    "db:seed": "pnpm --filter @pgag/api db:seed",
+    "docker:up": "docker compose -f deploy/docker-compose.yml up -d",
+    "docker:down": "docker compose -f deploy/docker-compose.yml down",
+    "docker:logs": "docker compose -f deploy/docker-compose.yml logs -f"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
